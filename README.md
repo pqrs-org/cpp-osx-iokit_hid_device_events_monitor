@@ -1,13 +1,24 @@
-[![Build Status](https://github.com/pqrs-org/cpp-osx-iokit_hid_queue_value_monitor/workflows/CI/badge.svg)](https://github.com/pqrs-org/cpp-osx-iokit_hid_queue_value_monitor/actions)
-[![License](https://img.shields.io/badge/license-Boost%20Software%20License-blue.svg)](https://github.com/pqrs-org/cpp-osx-iokit_hid_queue_value_monitor/blob/main/LICENSE.md)
+[![Build Status](https://github.com/pqrs-org/cpp-osx-iokit_hid_device_events_monitor/workflows/CI/badge.svg)](https://github.com/pqrs-org/cpp-osx-iokit_hid_device_events_monitor/actions)
+[![License](https://img.shields.io/badge/license-Boost%20Software%20License-blue.svg)](https://github.com/pqrs-org/cpp-osx-iokit_hid_device_events_monitor/blob/main/LICENSE.md)
 
-# cpp-osx-iokit_hid_queue_value_monitor
+# cpp-osx-iokit_hid_device_events_monitor
 
-A wrapper of `IOHIDQueueRegisterValueAvailableCallback`.
+A wrapper that manages `IOHIDQueueRegisterValueAvailableCallback` and optional
+`IOHIDDeviceRegisterInputReportCallback` observation in the same device lifecycle.
+
+Raw input report observation is disabled by default. Enable it with
+`parameters{.observe_input_reports = true}`. `input_report_arrived` is invoked
+from the dispatcher thread, and its report span is valid only during the signal
+invocation.
+
+`parameters.input_report_filter` can reject reports before their borrowed IOKit
+buffers are copied and enqueued to the dispatcher. The filter is invoked
+synchronously on the supplied run loop thread, so it should remain lightweight
+and must not destroy the monitor synchronously.
 
 ## Requirements
 
-cpp-osx-iokit_hid_queue_value_monitor depends the following classes.
+cpp-osx-iokit_hid_device_events_monitor depends on the following classes.
 
 - [Nod](https://github.com/fr00b0/nod)
 - [pqrs::cf::run_loop_thread](https://github.com/pqrs-org/cpp-cf-run_loop_thread)

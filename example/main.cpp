@@ -2,8 +2,8 @@
 #include <IOKit/hid/IOHIDUsageTables.h>
 #include <IOKit/hid/IOHIDValue.h>
 #include <csignal>
+#include <pqrs/osx/iokit_hid_device_events_monitor.hpp>
 #include <pqrs/osx/iokit_hid_manager.hpp>
-#include <pqrs/osx/iokit_hid_queue_value_monitor.hpp>
 
 namespace {
 auto global_wait = pqrs::make_thread_wait();
@@ -18,7 +18,7 @@ int main() {
   auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
   auto run_loop_thread = std::make_shared<pqrs::cf::run_loop_thread>();
 
-  std::unordered_map<pqrs::osx::iokit_registry_entry_id::value_t, pqrs::not_null_shared_ptr_t<pqrs::osx::iokit_hid_queue_value_monitor>> monitors;
+  std::unordered_map<pqrs::osx::iokit_registry_entry_id::value_t, pqrs::not_null_shared_ptr_t<pqrs::osx::iokit_hid_device_events_monitor>> monitors;
 
   std::vector<pqrs::cf::cf_ptr<CFDictionaryRef>> matching_dictionaries{
       pqrs::osx::iokit_hid_manager::make_matching_dictionary(
@@ -55,9 +55,16 @@ int main() {
         std::cout << "  product_id:" << *product_id << std::endl;
       }
 
-      auto m = std::make_shared<pqrs::osx::iokit_hid_queue_value_monitor>(dispatcher,
-                                                                          run_loop_thread,
-                                                                          *device_ptr);
+      auto m = std::make_shared<pqrs::osx::iokit_hid_device_events_monitor>(
+          dispatcher,
+          run_loop_thread,
+          *device_ptr,
+          pqrs::osx::iokit_hid_device_events_monitor::parameters{
+              .observe_input_reports = true,
+              .input_report_filter = [](auto report_id, auto) {
+                return report_id == 1;
+              },
+          });
       monitors.insert_or_assign(registry_entry_id, m);
 
       m->started.connect([registry_entry_id] {
@@ -78,6 +85,13 @@ int main() {
                       << std::endl;
           }
         }
+      });
+
+      m->input_report_arrived.connect([](auto&& report_id, auto&& report) {
+        std::cout << "input_report:"
+                  << report_id
+                  << " (" << report.size() << " bytes)"
+                  << std::endl;
       });
 
       m->error_occurred.connect([](auto&& message, auto&& iokit_return) {

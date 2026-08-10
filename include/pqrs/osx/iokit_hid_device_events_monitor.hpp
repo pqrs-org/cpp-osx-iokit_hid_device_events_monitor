@@ -1,6 +1,6 @@
 #pragma once
 
-// pqrs::osx::iokit_hid_queue_value_monitor v2.3.0
+// pqrs::osx::iokit_hid_device_events_monitor v0.0.0
 
 // (C) Copyright Takayama Fumihiko 2018.
 // Distributed under the Boost Software License, Version 1.0.
@@ -9,6 +9,8 @@
 #include <IOKit/hid/IOHIDDevice.h>
 #include <IOKit/hid/IOHIDQueue.h>
 #include <chrono>
+#include <functional>
+#include <memory>
 #include <nod/nod.hpp>
 #include <optional>
 #include <pqrs/cf/run_loop_thread.hpp>
@@ -17,55 +19,92 @@
 #include <pqrs/osx/iokit_hid_device.hpp>
 #include <pqrs/osx/iokit_return.hpp>
 #include <pqrs/osx/iokit_types.hpp>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace pqrs::osx {
-class iokit_hid_queue_value_monitor final : public dispatcher::extra::dispatcher_client {
+class iokit_hid_device_events_monitor final : public dispatcher::extra::dispatcher_client {
 public:
+  //
   // Signals (invoked from the dispatcher thread)
+  //
 
   nod::signal<void()> started;
   nod::signal<void()> stopped;
   nod::signal<void(not_null_shared_ptr_t<std::vector<cf::cf_ptr<IOHIDValueRef>>>)> values_arrived;
   nod::signal<void(const std::string&, iokit_return)> error_occurred;
+  // The report span is valid only for the duration of the signal invocation.
+  nod::signal<void(uint32_t report_id, std::span<const uint8_t> report)> input_report_arrived;
 
+  //
   // Methods
+  //
 
-  iokit_hid_queue_value_monitor(const iokit_hid_queue_value_monitor&) = delete;
+  iokit_hid_device_events_monitor(const iokit_hid_device_events_monitor&) = delete;
+
+  struct parameters final {
+    bool observe_input_reports = false;
+
+    // Invoked synchronously and serially in the supplied run_loop_thread.
+    // The same monitor instance never invokes this filter concurrently.
+    // The filter must not destroy this monitor synchronously.
+    std::function<bool(uint32_t report_id,
+                       std::span<const uint8_t> report)>
+        input_report_filter;
+  };
 
   // CFRunLoopRun may get stuck in rare cases if cf::run_loop_thread generation is repeated frequently in macOS 13.
   // If such a condition occurs, cf::run_loop_thread detects it and calls abort to avoid it.
   // However, to avoid the problem itself, cf::run_loop_thread should be provided externally instead of having it internally.
-  iokit_hid_queue_value_monitor(std::weak_ptr<dispatcher::dispatcher> weak_dispatcher,
-                                not_null_shared_ptr_t<cf::run_loop_thread> run_loop_thread,
-                                IOHIDDeviceRef device)
+  iokit_hid_device_events_monitor(std::weak_ptr<dispatcher::dispatcher> weak_dispatcher,
+                                  not_null_shared_ptr_t<cf::run_loop_thread> run_loop_thread,
+                                  IOHIDDeviceRef device)
+      : iokit_hid_device_events_monitor(weak_dispatcher,
+                                        run_loop_thread,
+                                        device,
+                                        parameters{}) {
+  }
+
+  iokit_hid_device_events_monitor(std::weak_ptr<dispatcher::dispatcher> weak_dispatcher,
+                                  not_null_shared_ptr_t<cf::run_loop_thread> run_loop_thread,
+                                  IOHIDDeviceRef device,
+                                  const parameters& parameters)
       : dispatcher_client(weak_dispatcher),
         run_loop_thread_(run_loop_thread),
         hid_device_(device),
         open_timer_(*this),
-        last_open_error_(kIOReturnSuccess) {
+        last_open_error_(kIOReturnSuccess),
+        input_report_filter_(parameters.input_report_filter) {
+    if (parameters.observe_input_reports) {
+      constexpr size_t minimum_input_report_buffer_size = 1024;
+
+      auto size = minimum_input_report_buffer_size;
+      if (auto max_input_report_size = hid_device_.find_max_input_report_size()) {
+        if (*max_input_report_size > static_cast<int64_t>(size)) {
+          size = static_cast<size_t>(*max_input_report_size);
+        }
+      }
+      input_report_buffer_.resize(size);
+    }
+
     // Schedule device
 
-    auto wait = make_thread_wait();
+    if (CFRunLoopGetCurrent() == run_loop_thread_->get_run_loop()) {
+      schedule_device();
+    } else {
+      auto wait = make_thread_wait();
 
-    run_loop_thread_->enqueue(^{
-      if (auto d = hid_device_.get_device()) {
-        IOHIDDeviceRegisterRemovalCallback(*d,
-                                           static_device_removal_callback,
-                                           this);
+      run_loop_thread_->enqueue(^{
+        schedule_device();
+        wait->notify();
+      });
 
-        IOHIDDeviceScheduleWithRunLoop(*d,
-                                       run_loop_thread_->get_run_loop(),
-                                       kCFRunLoopCommonModes);
-      }
-
-      wait->notify();
-    });
-
-    wait->wait_notice();
+      wait->wait_notice();
+    }
   }
 
-  ~iokit_hid_queue_value_monitor() override {
+  ~iokit_hid_device_events_monitor() override {
     //
     // dispatcher_client
     //
@@ -76,21 +115,18 @@ public:
     // run_loop_thread
     //
 
-    auto wait = make_thread_wait();
+    if (CFRunLoopGetCurrent() == run_loop_thread_->get_run_loop()) {
+      cleanup_device();
+    } else {
+      auto wait = make_thread_wait();
 
-    run_loop_thread_->enqueue(^{
-      stop({.check_requested_open_options = false});
+      run_loop_thread_->enqueue(^{
+        cleanup_device();
+        wait->notify();
+      });
 
-      if (auto d = hid_device_.get_device()) {
-        IOHIDDeviceUnscheduleFromRunLoop(*d,
-                                         run_loop_thread_->get_run_loop(),
-                                         kCFRunLoopCommonModes);
-      }
-
-      wait->notify();
-    });
-
-    wait->wait_notice();
+      wait->wait_notice();
+    }
   }
 
   void async_start(IOOptionBits open_options,
@@ -133,6 +169,44 @@ public:
   }
 
 private:
+  void schedule_device() {
+    if (auto d = hid_device_.get_device()) {
+      if (!input_report_buffer_.empty()) {
+        IOHIDDeviceRegisterInputReportCallback(*d,
+                                               input_report_buffer_.data(),
+                                               static_cast<CFIndex>(input_report_buffer_.size()),
+                                               static_input_report_callback,
+                                               this);
+      }
+
+      IOHIDDeviceRegisterRemovalCallback(*d,
+                                         static_device_removal_callback,
+                                         this);
+
+      IOHIDDeviceScheduleWithRunLoop(*d,
+                                     run_loop_thread_->get_run_loop(),
+                                     kCFRunLoopCommonModes);
+    }
+  }
+
+  void cleanup_device() {
+    stop({.check_requested_open_options = false});
+
+    if (auto d = hid_device_.get_device()) {
+      if (!input_report_buffer_.empty()) {
+        IOHIDDeviceRegisterInputReportCallback(*d,
+                                               input_report_buffer_.data(),
+                                               static_cast<CFIndex>(input_report_buffer_.size()),
+                                               nullptr,
+                                               nullptr);
+      }
+
+      IOHIDDeviceUnscheduleFromRunLoop(*d,
+                                       run_loop_thread_->get_run_loop(),
+                                       kCFRunLoopCommonModes);
+    }
+  }
+
   void start() {
     bool needs_stop = false;
     IOOptionBits open_options = kIOHIDOptionsTypeNone;
@@ -188,10 +262,12 @@ private:
       }
     }
 
+    last_open_error_ = kIOReturnSuccess;
+
     {
       std::lock_guard<std::mutex> lock(open_options_mutex_);
 
-      current_open_options_ = requested_open_options_;
+      current_open_options_ = open_options;
     }
 
     enqueue_to_dispatcher([this] {
@@ -291,7 +367,7 @@ private:
       return;
     }
 
-    auto self = static_cast<iokit_hid_queue_value_monitor*>(context);
+    auto self = static_cast<iokit_hid_device_events_monitor*>(context);
     if (!self) {
       return;
     }
@@ -310,7 +386,7 @@ private:
       return;
     }
 
-    auto self = static_cast<iokit_hid_queue_value_monitor*>(context);
+    auto self = static_cast<iokit_hid_device_events_monitor*>(context);
     if (!self) {
       return;
     }
@@ -345,6 +421,64 @@ private:
     }
   }
 
+  static void static_input_report_callback(void* context,
+                                           IOReturn result,
+                                           void* sender,
+                                           IOHIDReportType type,
+                                           uint32_t report_id,
+                                           uint8_t* report,
+                                           CFIndex report_length) {
+    if (result != kIOReturnSuccess ||
+        type != kIOHIDReportTypeInput ||
+        report == nullptr ||
+        report_length < 0) {
+      return;
+    }
+
+    auto self = static_cast<iokit_hid_device_events_monitor*>(context);
+    if (!self) {
+      return;
+    }
+
+    self->input_report_callback(report_id,
+                                std::span<const uint8_t>(report,
+                                                         static_cast<size_t>(report_length)));
+  }
+
+  void input_report_callback(uint32_t report_id,
+                             std::span<const uint8_t> report) {
+    // macOS may invoke callbacks even if IOHIDDeviceOpen failed. Apply the same
+    // guard used by queue_value_available_callback.
+    {
+      std::lock_guard<std::mutex> lock(open_options_mutex_);
+
+      if (!current_open_options_) {
+        return;
+      }
+    }
+
+    // Run the filter before copying the borrowed IOKit buffer or enqueueing work
+    // to the dispatcher. The filter is invoked synchronously in run_loop_thread_.
+    if (input_report_filter_) {
+      try {
+        if (!input_report_filter_(report_id, report)) {
+          return;
+        }
+      } catch (...) {
+        // Treat filter exceptions as rejected reports.
+        return;
+      }
+    }
+
+    auto report_copy = std::make_shared<std::vector<uint8_t>>(report.begin(),
+                                                              report.end());
+
+    enqueue_to_dispatcher([this, report_id, report_copy] {
+      input_report_arrived(report_id,
+                           std::span<const uint8_t>(*report_copy));
+    });
+  }
+
   not_null_shared_ptr_t<cf::run_loop_thread> run_loop_thread_;
 
   iokit_hid_device hid_device_;
@@ -354,5 +488,9 @@ private:
   mutable std::mutex open_options_mutex_;
   iokit_return last_open_error_;
   cf::cf_ptr<IOHIDQueueRef> queue_;
+  std::vector<uint8_t> input_report_buffer_;
+  std::function<bool(uint32_t report_id,
+                     std::span<const uint8_t> report)>
+      input_report_filter_;
 };
 } // namespace pqrs::osx
