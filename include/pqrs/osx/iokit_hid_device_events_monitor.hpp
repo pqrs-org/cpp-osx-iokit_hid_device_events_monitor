@@ -9,8 +9,10 @@
 #include <IOKit/hid/IOHIDDevice.h>
 #include <IOKit/hid/IOHIDQueue.h>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <nod/nod.hpp>
 #include <optional>
 #include <pqrs/cf/run_loop_thread.hpp>
@@ -20,6 +22,7 @@
 #include <pqrs/osx/iokit_return.hpp>
 #include <pqrs/osx/iokit_types.hpp>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -137,6 +140,7 @@ public:
       std::lock_guard<std::mutex> lock(open_options_mutex_);
 
       requested_open_options_ = open_options;
+      ++requested_open_options_generation_;
     }
 
     run_loop_thread_->enqueue(^{
@@ -151,14 +155,22 @@ public:
   }
 
   void async_stop() {
+    uint64_t requested_open_options_generation = 0;
+
     {
       std::lock_guard<std::mutex> lock(open_options_mutex_);
 
+      if (!requested_open_options_) {
+        return;
+      }
+
       requested_open_options_ = std::nullopt;
+      requested_open_options_generation = ++requested_open_options_generation_;
     }
 
     run_loop_thread_->enqueue(^{
-      stop({.check_requested_open_options = true});
+      stop({.reason = stop_reason::async_stop,
+            .requested_open_options_generation = requested_open_options_generation});
     });
   }
 
@@ -192,7 +204,7 @@ private:
   }
 
   void cleanup_device() {
-    stop({.check_requested_open_options = false});
+    stop({.reason = stop_reason::cleanup});
 
     if (auto d = hid_device_.get_device()) {
       if (!input_report_buffer_.empty()) {
@@ -238,7 +250,7 @@ private:
     }
 
     if (needs_stop) {
-      stop({.check_requested_open_options = false});
+      stop({.reason = stop_reason::reopen});
     }
 
     //
@@ -282,39 +294,71 @@ private:
     open_timer_.stop();
   }
 
-  struct stop_arguments {
-    bool check_requested_open_options;
+  enum class stop_reason {
+    async_stop,
+    reopen,
+    device_removal,
+    cleanup,
   };
+
+  struct stop_arguments final {
+    stop_reason reason;
+    std::optional<uint64_t> requested_open_options_generation;
+  };
+
   void stop(stop_arguments args) {
     // Since `stop()` can be called from within `start()`,
     // we must not stop `open_timer_` in `stop()` in order to preserve the retry when `IOHIDDeviceOpen` error.
 
-    IOOptionBits open_options = kIOHIDOptionsTypeNone;
-
-    auto device = hid_device_.get_device();
-    if (!device) {
-      return;
-    }
+    std::optional<IOOptionBits> open_options;
+    bool should_emit_stopped = false;
 
     {
       std::lock_guard<std::mutex> lock(open_options_mutex_);
 
-      if (current_open_options_ == std::nullopt) {
-        return;
+      switch (args.reason) {
+        case stop_reason::async_stop:
+          // Ignore this asynchronous stop if it has been superseded by a newer start or stop request.
+          if (requested_open_options_ ||
+              args.requested_open_options_generation != requested_open_options_generation_) {
+            return;
+          }
+          should_emit_stopped = true;
+          break;
+
+        case stop_reason::reopen:
+          should_emit_stopped = current_open_options_.has_value();
+          break;
+
+        case stop_reason::device_removal:
+          should_emit_stopped = requested_open_options_.has_value() ||
+                                current_open_options_.has_value() ||
+                                input_values_queue_;
+          requested_open_options_ = std::nullopt;
+          ++requested_open_options_generation_;
+          break;
+
+        case stop_reason::cleanup:
+          requested_open_options_ = std::nullopt;
+          ++requested_open_options_generation_;
+          break;
       }
 
-      if (args.check_requested_open_options &&
-          requested_open_options_ != std::nullopt) {
-        return;
-      }
-
-      open_options = *current_open_options_;
+      open_options = current_open_options_;
     }
 
+    //
+    // The stop request is valid at this point, so release the resources and close the device.
+    //
+
+    // Stop value delivery before closing the device to prevent callbacks during IOHIDDeviceClose.
     stop_input_values_queue();
 
-    IOHIDDeviceClose(*device,
-                     open_options);
+    auto device = hid_device_.get_device();
+    if (device && open_options) {
+      IOHIDDeviceClose(*device,
+                       *open_options);
+    }
 
     {
       std::lock_guard<std::mutex> lock(open_options_mutex_);
@@ -322,9 +366,11 @@ private:
       current_open_options_ = std::nullopt;
     }
 
-    enqueue_to_dispatcher([this] {
-      stopped();
-    });
+    if (should_emit_stopped) {
+      enqueue_to_dispatcher([this] {
+        stopped();
+      });
+    }
   }
 
   void start_input_values_queue() {
@@ -380,7 +426,7 @@ private:
   }
 
   void device_removal_callback() {
-    stop({.check_requested_open_options = false});
+    stop({.reason = stop_reason::device_removal});
   }
 
   static void static_input_values_available_callback(void* context,
@@ -432,21 +478,43 @@ private:
                                            uint32_t report_id,
                                            uint8_t* report,
                                            CFIndex report_length) {
-    if (result != kIOReturnSuccess ||
-        type != kIOHIDReportTypeInput ||
-        report == nullptr ||
-        report_length < 0) {
+    auto self = static_cast<iokit_hid_device_events_monitor*>(context);
+    if (!self) {
       return;
     }
 
-    auto self = static_cast<iokit_hid_device_events_monitor*>(context);
-    if (!self) {
+    if (result != kIOReturnSuccess) {
+      self->input_report_error_callback(result);
+      return;
+    }
+
+    if (type != kIOHIDReportTypeInput ||
+        report == nullptr ||
+        report_length < 0) {
       return;
     }
 
     self->input_report_callback(report_id,
                                 std::span<const uint8_t>(report,
                                                          static_cast<size_t>(report_length)));
+  }
+
+  void input_report_error_callback(IOReturn result) {
+    // The input report callback is registered before IOHIDDeviceOpen and remains
+    // registered while the device is closed. Report errors should be emitted
+    // only while the device is successfully open.
+    {
+      std::lock_guard<std::mutex> lock(open_options_mutex_);
+
+      if (!current_open_options_) {
+        return;
+      }
+    }
+
+    iokit_return r = result;
+    enqueue_to_dispatcher([this, r] {
+      error_occurred("input report callback error", r);
+    });
   }
 
   void input_report_callback(uint32_t report_id,
@@ -488,6 +556,7 @@ private:
   iokit_hid_device hid_device_;
   dispatcher::extra::timer open_timer_;
   std::optional<IOOptionBits> requested_open_options_;
+  uint64_t requested_open_options_generation_{0};
   std::optional<IOOptionBits> current_open_options_;
   mutable std::mutex open_options_mutex_;
   iokit_return last_open_error_;
