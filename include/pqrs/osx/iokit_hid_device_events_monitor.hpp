@@ -32,10 +32,10 @@ public:
 
   nod::signal<void()> started;
   nod::signal<void()> stopped;
-  nod::signal<void(not_null_shared_ptr_t<std::vector<cf::cf_ptr<IOHIDValueRef>>>)> values_arrived;
-  nod::signal<void(const std::string&, iokit_return)> error_occurred;
+  nod::signal<void(not_null_shared_ptr_t<std::vector<cf::cf_ptr<IOHIDValueRef>>>)> input_values_arrived;
   // The report span is valid only for the duration of the signal invocation.
   nod::signal<void(uint32_t report_id, std::span<const uint8_t> report)> input_report_arrived;
+  nod::signal<void(const std::string&, iokit_return)> error_occurred;
 
   //
   // Methods
@@ -44,6 +44,7 @@ public:
   iokit_hid_device_events_monitor(const iokit_hid_device_events_monitor&) = delete;
 
   struct parameters final {
+    bool observe_input_values = true;
     bool observe_input_reports = false;
 
     // Invoked synchronously and serially in the supplied run_loop_thread.
@@ -75,6 +76,7 @@ public:
         hid_device_(device),
         open_timer_(*this),
         last_open_error_(kIOReturnSuccess),
+        observe_input_values_(parameters.observe_input_values),
         input_report_filter_(parameters.input_report_filter) {
     if (parameters.observe_input_reports) {
       constexpr size_t minimum_input_report_buffer_size = 1024;
@@ -244,7 +246,9 @@ private:
     //
 
     // Start queue before `IOHIDDeviceOpen` in order to avoid events drop.
-    start_queue();
+    if (observe_input_values_) {
+      start_queue();
+    }
 
     {
       iokit_return r = IOHIDDeviceOpen(*device,
@@ -416,7 +420,7 @@ private:
       }
 
       enqueue_to_dispatcher([this, values] {
-        values_arrived(values);
+        input_values_arrived(values);
       });
     }
   }
@@ -488,6 +492,7 @@ private:
   mutable std::mutex open_options_mutex_;
   iokit_return last_open_error_;
   cf::cf_ptr<IOHIDQueueRef> queue_;
+  bool observe_input_values_;
   std::vector<uint8_t> input_report_buffer_;
   std::function<bool(uint32_t report_id,
                      std::span<const uint8_t> report)>

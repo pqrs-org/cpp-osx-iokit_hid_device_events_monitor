@@ -10,21 +10,37 @@ int main() {
     auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
     auto run_loop_thread = std::make_shared<pqrs::cf::run_loop_thread>();
 
+    // Observe input values only.
     auto monitor = std::make_unique<pqrs::osx::iokit_hid_device_events_monitor>(dispatcher,
                                                                                 run_loop_thread,
                                                                                 nullptr);
     expect(!monitor->seized());
     monitor = nullptr;
 
+    // Observe input reports only.
     monitor = std::make_unique<pqrs::osx::iokit_hid_device_events_monitor>(
         dispatcher,
         run_loop_thread,
         nullptr,
         pqrs::osx::iokit_hid_device_events_monitor::parameters{
+            .observe_input_values = false,
             .observe_input_reports = true,
             .input_report_filter = [](auto, auto) {
               return true;
             },
+        });
+    expect(!monitor->seized());
+
+    monitor = nullptr;
+
+    // Observe both input values and input reports.
+    monitor = std::make_unique<pqrs::osx::iokit_hid_device_events_monitor>(
+        dispatcher,
+        run_loop_thread,
+        nullptr,
+        pqrs::osx::iokit_hid_device_events_monitor::parameters{
+            .observe_input_values = true,
+            .observe_input_reports = true,
         });
     expect(!monitor->seized());
 

@@ -3,18 +3,10 @@
 
 # cpp-osx-iokit_hid_device_events_monitor
 
-A wrapper that manages `IOHIDQueueRegisterValueAvailableCallback` and optional
-`IOHIDDeviceRegisterInputReportCallback` observation in the same device lifecycle.
+A wrapper for observing HID input values, input reports, or both in the same
+device lifecycle. Input value observation is enabled by default.
 
-Raw input report observation is disabled by default. Enable it with
-`parameters{.observe_input_reports = true}`. `input_report_arrived` is invoked
-from the dispatcher thread, and its report span is valid only during the signal
-invocation.
-
-`parameters.input_report_filter` can reject reports before their borrowed IOKit
-buffers are copied and enqueued to the dispatcher. The filter is invoked
-synchronously on the supplied run loop thread, so it should remain lightweight
-and must not destroy the monitor synchronously.
+See [example/main.cpp](example/main.cpp) for configuration examples.
 
 ## Requirements
 

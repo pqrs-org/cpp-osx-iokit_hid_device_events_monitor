@@ -59,7 +59,11 @@ int main() {
           dispatcher,
           run_loop_thread,
           *device_ptr,
+          // The default observes input values only. Set both observation flags
+          // to true to receive both input_values_arrived and input_report_arrived.
+          // Set observe_input_values to false for input reports only.
           pqrs::osx::iokit_hid_device_events_monitor::parameters{
+              .observe_input_values = true,
               .observe_input_reports = true,
               .input_report_filter = [](auto report_id, auto) {
                 return report_id == 1;
@@ -75,7 +79,7 @@ int main() {
         std::cout << "stopped " << registry_entry_id << std::endl;
       });
 
-      m->values_arrived.connect([](auto&& values) {
+      m->input_values_arrived.connect([](auto&& values) {
         for (const auto& value_ptr : *values) {
           if (auto e = IOHIDValueGetElement(*value_ptr)) {
             std::cout << "value:"
