@@ -247,7 +247,7 @@ private:
 
     // Start queue before `IOHIDDeviceOpen` in order to avoid events drop.
     if (observe_input_values_) {
-      start_queue();
+      start_input_values_queue();
     }
 
     {
@@ -311,7 +311,7 @@ private:
       open_options = *current_open_options_;
     }
 
-    stop_queue();
+    stop_input_values_queue();
 
     IOHIDDeviceClose(*device,
                      open_options);
@@ -327,40 +327,40 @@ private:
     });
   }
 
-  void start_queue() {
-    if (!queue_) {
+  void start_input_values_queue() {
+    if (!input_values_queue_) {
       const CFIndex depth = 1024;
-      queue_ = hid_device_.make_queue(depth);
+      input_values_queue_ = hid_device_.make_queue(depth);
 
-      if (queue_) {
+      if (input_values_queue_) {
         for (const auto& e : hid_device_.make_elements()) {
-          IOHIDQueueAddElement(*queue_, *e);
+          IOHIDQueueAddElement(*input_values_queue_, *e);
         }
 
-        IOHIDQueueRegisterValueAvailableCallback(*queue_,
-                                                 static_queue_value_available_callback,
+        IOHIDQueueRegisterValueAvailableCallback(*input_values_queue_,
+                                                 static_input_values_available_callback,
                                                  this);
 
-        IOHIDQueueScheduleWithRunLoop(*queue_,
+        IOHIDQueueScheduleWithRunLoop(*input_values_queue_,
                                       run_loop_thread_->get_run_loop(),
                                       kCFRunLoopCommonModes);
 
-        IOHIDQueueStart(*queue_);
+        IOHIDQueueStart(*input_values_queue_);
       }
     }
   }
 
-  void stop_queue() {
-    if (queue_) {
-      IOHIDQueueStop(*queue_);
+  void stop_input_values_queue() {
+    if (input_values_queue_) {
+      IOHIDQueueStop(*input_values_queue_);
 
       // IOHIDQueueUnscheduleFromRunLoop might cause SIGSEGV if it is not called in run_loop_thread_.
 
-      IOHIDQueueUnscheduleFromRunLoop(*queue_,
+      IOHIDQueueUnscheduleFromRunLoop(*input_values_queue_,
                                       run_loop_thread_->get_run_loop(),
                                       kCFRunLoopCommonModes);
 
-      queue_ = nullptr;
+      input_values_queue_ = nullptr;
     }
   }
 
@@ -383,9 +383,9 @@ private:
     stop({.check_requested_open_options = false});
   }
 
-  static void static_queue_value_available_callback(void* context,
-                                                    IOReturn result,
-                                                    void* sender) {
+  static void static_input_values_available_callback(void* context,
+                                                     IOReturn result,
+                                                     void* sender) {
     if (result != kIOReturnSuccess) {
       return;
     }
@@ -395,14 +395,14 @@ private:
       return;
     }
 
-    self->queue_value_available_callback();
+    self->input_values_available_callback();
   }
 
-  void queue_value_available_callback() {
-    if (queue_) {
+  void input_values_available_callback() {
+    if (input_values_queue_) {
       not_null_shared_ptr_t<std::vector<cf::cf_ptr<IOHIDValueRef>>> values = std::make_shared<std::vector<cf::cf_ptr<IOHIDValueRef>>>();
 
-      while (auto v = cf::adopt_cf_ptr(IOHIDQueueCopyNextValueWithTimeout(*queue_, 0.0))) {
+      while (auto v = cf::adopt_cf_ptr(IOHIDQueueCopyNextValueWithTimeout(*input_values_queue_, 0.0))) {
         values->emplace_back(std::move(v));
       }
 
@@ -452,7 +452,7 @@ private:
   void input_report_callback(uint32_t report_id,
                              std::span<const uint8_t> report) {
     // macOS may invoke callbacks even if IOHIDDeviceOpen failed. Apply the same
-    // guard used by queue_value_available_callback.
+    // guard used by input_values_available_callback.
     {
       std::lock_guard<std::mutex> lock(open_options_mutex_);
 
@@ -491,7 +491,7 @@ private:
   std::optional<IOOptionBits> current_open_options_;
   mutable std::mutex open_options_mutex_;
   iokit_return last_open_error_;
-  cf::cf_ptr<IOHIDQueueRef> queue_;
+  cf::cf_ptr<IOHIDQueueRef> input_values_queue_;
   bool observe_input_values_;
   std::vector<uint8_t> input_report_buffer_;
   std::function<bool(uint32_t report_id,
