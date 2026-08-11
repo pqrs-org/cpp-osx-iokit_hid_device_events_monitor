@@ -15,6 +15,7 @@ cpp-osx-iokit_hid_device_events_monitor depends on the following classes.
 - [Nod](https://github.com/fr00b0/nod)
 - [pqrs::cf::run_loop_thread](https://github.com/pqrs-org/cpp-cf-run_loop_thread)
 - [pqrs::dispatcher](https://github.com/pqrs-org/cpp-dispatcher)
+- [pqrs::osx::chrono](https://github.com/pqrs-org/cpp-osx-chrono)
 - [pqrs::osx::iokit_hid_device](https://github.com/pqrs-org/cpp-osx-iokit_hid_device)
 - [pqrs::osx::iokit_return](https://github.com/pqrs-org/cpp-osx-iokit_return)
 
