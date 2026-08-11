@@ -1,0 +1,39 @@
+#pragma once
+
+// (C) Copyright Takayama Fumihiko 2019.
+// Distributed under the Boost Software License, Version 1.0.
+// (See https://www.boost.org/LICENSE_1_0.txt)
+
+#include "absolute_time_point.hpp"
+#include "impl/chrono.hpp"
+#include <chrono>
+#include <mach/mach_time.h>
+#include <time.h>
+
+namespace pqrs::osx::chrono {
+[[nodiscard]] inline absolute_time_point mach_absolute_time_point() noexcept {
+  return absolute_time_point(mach_absolute_time());
+}
+
+[[nodiscard]] inline std::chrono::nanoseconds make_nanoseconds(absolute_time_duration time) noexcept {
+  auto& t = impl::get_mach_timebase_info_data();
+  if (t.numer != t.denom && t.denom != 0) {
+    auto f = static_cast<double>(t.numer) / t.denom;
+    return std::chrono::nanoseconds(static_cast<int64_t>(type_safe::get(time) * f));
+  }
+  return std::chrono::nanoseconds(type_safe::get(time));
+}
+
+[[nodiscard]] inline std::chrono::milliseconds make_milliseconds(absolute_time_duration time) noexcept {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(make_nanoseconds(time));
+}
+
+[[nodiscard]] inline absolute_time_duration make_absolute_time_duration(std::chrono::nanoseconds time) noexcept {
+  auto& t = impl::get_mach_timebase_info_data();
+  if (t.numer != t.denom && t.numer != 0) {
+    auto f = static_cast<double>(t.denom) / t.numer;
+    return absolute_time_duration(static_cast<int64_t>(time.count() * f));
+  }
+  return absolute_time_duration(time.count());
+}
+} // namespace pqrs::osx::chrono
