@@ -91,10 +91,11 @@ int main() {
         }
       });
 
-      m->input_report_arrived.connect([](auto&& report_id, auto&& report) {
+      m->input_report_arrived.connect([](auto&& report_id, auto&& report, auto&& time_stamp) {
         std::cout << "input_report:"
                   << report_id
                   << " (" << report.size() << " bytes)"
+                  << " time_stamp:" << time_stamp
                   << std::endl;
       });
 
