@@ -1,9 +1,32 @@
 #include <boost/ut.hpp>
 #include <pqrs/osx/iokit_hid_device_events_monitor.hpp>
+#include <stdexcept>
 
 int main() {
   using namespace boost::ut;
   using namespace boost::ut::literals;
+
+  "constructor filter copy exception"_test = [] {
+    struct throwing_filter {
+      throwing_filter() = default;
+      throwing_filter(const throwing_filter&) {
+        throw std::runtime_error("filter copy failed");
+      }
+      throwing_filter(throwing_filter&&) = default;
+      bool operator()(uint32_t, std::span<const uint8_t>) const {
+        return true;
+      }
+    };
+    auto source = std::make_shared<pqrs::dispatcher::pseudo_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(source);
+    auto run_loop_thread = std::make_shared<pqrs::cf::run_loop_thread>();
+    pqrs::osx::iokit_hid_device_events_monitor::parameters parameters;
+    parameters.input_report_filter = throwing_filter{};
+    expect(throws<std::runtime_error>([&] {
+      pqrs::osx::iokit_hid_device_events_monitor monitor(dispatcher, run_loop_thread, nullptr, parameters);
+    }));
+    run_loop_thread->terminate();
+  };
 
   "iokit_hid_device_events_monitor"_test = [] {
     auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
