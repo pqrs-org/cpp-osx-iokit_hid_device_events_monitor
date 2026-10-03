@@ -92,8 +92,7 @@ public:
       : dispatcher_client(weak_dispatcher),
         run_loop_thread_(run_loop_thread),
         hid_device_(device),
-        parameters_(parameters),
-        open_timer_(*this) {
+        parameters_(parameters) {
     dispatcher_client_constructor_exception_guard_.initialize(
         [&] {
           if (parameters_.observe_input_reports) {
@@ -594,6 +593,6 @@ private:
   std::vector<uint8_t> input_report_buffer_;
 
   // Construct after potentially throwing members; destruction requires detach.
-  dispatcher::extra::timer open_timer_;
+  dispatcher::extra::timer open_timer_{*this};
 };
 } // namespace pqrs::osx
