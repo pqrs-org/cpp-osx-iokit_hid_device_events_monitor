@@ -25,7 +25,8 @@ int main() {
   auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
   auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source,
                                                                    execute_with_autorelease_pool);
-  auto run_loop_thread = std::make_shared<pqrs::cf::run_loop_thread>();
+  auto run_loop_thread = std::make_shared<pqrs::cf::run_loop_thread>(pqrs::cf::run_loop_thread::failure_policy::abort,
+                                                                     execute_with_autorelease_pool);
 
   std::unordered_map<pqrs::osx::iokit_registry_entry_id::value_t, pqrs::not_null_shared_ptr_t<pqrs::osx::iokit_hid_device_events_monitor>> monitors;
 
