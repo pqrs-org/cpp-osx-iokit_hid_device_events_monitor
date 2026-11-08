@@ -1,6 +1,6 @@
 #pragma once
 
-// pqrs::cf::run_loop_thread v3.2.0
+// pqrs::cf::run_loop_thread v4.0.0
 
 // (C) Copyright Takayama Fumihiko 2018.
 // Distributed under the Boost Software License, Version 1.0.
@@ -12,7 +12,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <pqrs/cf/cf_ptr.hpp>
@@ -20,17 +19,15 @@
 #include <pqrs/thread_wait.hpp>
 #include <thread>
 #include <utility>
-#include <vector>
 
 namespace pqrs::cf {
 class run_loop_thread final {
 public:
-  class execution_scope {
-  public:
-    virtual ~execution_scope() = default;
-  };
-
-  using execution_scope_factory = std::function<std::unique_ptr<execution_scope>()>;
+  // `execution_wrapper` must invoke the supplied function exactly once,
+  // synchronously, and return after the function has finished.
+  // The supplied function runs one CFRunLoopRunInMode activation and may block
+  // for up to `run_loop_run_timeout`, even when the run loop handles no events.
+  using execution_wrapper = std::function<void(const std::function<void()>&)>;
 
   enum class failure_policy {
     abort,
@@ -50,89 +47,88 @@ public:
   }
 
   run_loop_thread(failure_policy policy,
-                  execution_scope_factory execution_scope_factory)
+                  execution_wrapper execution_wrapper)
       : failure_policy_(policy),
-        execution_scope_factory_(std::move(execution_scope_factory)) {
+        execution_wrapper_(std::move(execution_wrapper)) {
     using namespace std::chrono_literals;
 
-    std::atomic<bool> ready{false};
+    thread_ = std::thread([this] {
+      //
+      // Preparation
+      //
 
-    thread_ = std::thread([this, &ready] {
-      // Append a source to prevent immediately quitting of `CFRunLoopRun`.
+      // Add a keep-alive source to prevent `CFRunLoopRunInMode` from immediately quitting.
 
       auto context = CFRunLoopSourceContext();
-      context.info = reinterpret_cast<void*>(&ready);
+      context.info = reinterpret_cast<void*>(this);
       context.perform = [](void* _Nullable info) {
-        auto ready = reinterpret_cast<std::atomic<bool>*>(info);
-        ready->store(true);
+        auto self = reinterpret_cast<run_loop_thread*>(info);
+        self->ready_.store(true);
       };
 
       {
-        std::lock_guard<std::mutex> lock(initial_source_mutex_);
+        std::lock_guard<std::mutex> lock(keep_alive_source_mutex_);
 
         run_loop_ = CFRunLoopGetCurrent();
 
-        auto observer_context = CFRunLoopObserverContext();
-        observer_context.info = this;
-
-        begin_observer_ = adopt_cf_ptr(CFRunLoopObserverCreate(
-            kCFAllocatorDefault,
-            kCFRunLoopEntry | kCFRunLoopAfterWaiting,
-            true,
-            std::numeric_limits<CFIndex>::min(),
-            static_begin_observer_callback,
-            &observer_context));
-
-        end_observer_ = adopt_cf_ptr(CFRunLoopObserverCreate(
-            kCFAllocatorDefault,
-            kCFRunLoopBeforeWaiting | kCFRunLoopExit,
-            true,
-            std::numeric_limits<CFIndex>::max(),
-            static_end_observer_callback,
-            &observer_context));
-
-        CFRunLoopAddObserver(*run_loop_,
-                             *begin_observer_,
-                             kCFRunLoopCommonModes);
-
-        CFRunLoopAddObserver(*run_loop_,
-                             *end_observer_,
-                             kCFRunLoopCommonModes);
-
-        initial_source_ = adopt_cf_ptr(CFRunLoopSourceCreate(kCFAllocatorDefault,
-                                                             0,
-                                                             &context));
+        keep_alive_source_ = adopt_cf_ptr(CFRunLoopSourceCreate(kCFAllocatorDefault,
+                                                                0,
+                                                                &context));
 
         CFRunLoopAddSource(*run_loop_,
-                           *initial_source_,
+                           *keep_alive_source_,
                            kCFRunLoopCommonModes);
       }
 
+      //
       // Run
+      //
 
-      CFRunLoopRun();
+      // Run the run loop in finite activations so that `execution_wrapper_`
+      // has a well-defined lifetime outside CFRunLoop's internal scopes.
+      // Managing that lifetime with run-loop observer callbacks is unsafe:
+      // the callbacks run among CFRunLoop's internal autorelease-pool changes,
+      // so pushing and popping a pool there can violate LIFO ordering.
+      // The finite timeout also recreates the wrapper while the run loop is idle.
+      // `returnAfterSourceHandled` is false because source handling and
+      // CFRunLoopPerformBlock execution are not ordered; returning after one
+      // source could leave an enqueued block for a later activation.
+      constexpr CFTimeInterval run_loop_run_timeout = 1.0;
 
+      while (true) {
+        auto result = kCFRunLoopRunFinished;
+
+        const auto run = [&] {
+          result = CFRunLoopRunInMode(kCFRunLoopDefaultMode,
+                                      run_loop_run_timeout,
+                                      false);
+        };
+
+        if (execution_wrapper_) {
+          execution_wrapper_(run);
+        } else {
+          run();
+        }
+
+        if (result == kCFRunLoopRunFinished ||
+            result == kCFRunLoopRunStopped) {
+          break;
+        }
+      }
+
+      //
       // Remove source
-
-      execution_scopes_.clear();
-
-      CFRunLoopRemoveObserver(*run_loop_,
-                              *end_observer_,
-                              kCFRunLoopCommonModes);
-
-      CFRunLoopRemoveObserver(*run_loop_,
-                              *begin_observer_,
-                              kCFRunLoopCommonModes);
+      //
 
       CFRunLoopRemoveSource(*run_loop_,
-                            *initial_source_,
+                            *keep_alive_source_,
                             kCFRunLoopCommonModes);
     });
 
     // Wait until CFRunLoop is running.
 
     auto since = std::chrono::system_clock::now();
-    while (!ready) {
+    while (!ready_) {
       auto now = std::chrono::system_clock::now();
       if (now - since > 3s) {
         // Although this does not usually happen, it is reached when CFRunLoop processing does not start due to a problem with CFRunLoop.
@@ -147,10 +143,10 @@ public:
       }
 
       {
-        std::lock_guard<std::mutex> lock(initial_source_mutex_);
+        std::lock_guard<std::mutex> lock(keep_alive_source_mutex_);
 
-        if (run_loop_ && initial_source_) {
-          CFRunLoopSourceSignal(*initial_source_);
+        if (run_loop_ && keep_alive_source_) {
+          CFRunLoopSourceSignal(*keep_alive_source_);
           CFRunLoopWakeUp(*run_loop_);
         }
       }
@@ -166,9 +162,7 @@ public:
       abort();
     }
 
-    initial_source_ = nullptr;
-    end_observer_ = nullptr;
-    begin_observer_ = nullptr;
+    keep_alive_source_ = nullptr;
     run_loop_ = nullptr;
   }
 
@@ -223,70 +217,14 @@ public:
   }
 
 private:
-  static void static_begin_observer_callback(CFRunLoopObserverRef _Nonnull,
-                                             CFRunLoopActivity activity,
-                                             void* _Nullable info) {
-    if (auto self = reinterpret_cast<run_loop_thread*>(info)) {
-      switch (activity) {
-        case kCFRunLoopEntry:
-          self->execution_scopes_.push_back(self->make_execution_scope());
-          break;
-
-        case kCFRunLoopAfterWaiting:
-          if (!self->execution_scopes_.empty() &&
-              !self->execution_scopes_.back()) {
-            self->execution_scopes_.back() = self->make_execution_scope();
-          }
-          break;
-
-        default:
-          break;
-      }
-    }
-  }
-
-  static void static_end_observer_callback(CFRunLoopObserverRef _Nonnull,
-                                           CFRunLoopActivity activity,
-                                           void* _Nullable info) {
-    if (auto self = reinterpret_cast<run_loop_thread*>(info)) {
-      switch (activity) {
-        case kCFRunLoopBeforeWaiting:
-          if (!self->execution_scopes_.empty()) {
-            self->execution_scopes_.back().reset();
-          }
-          break;
-
-        case kCFRunLoopExit:
-          if (!self->execution_scopes_.empty()) {
-            self->execution_scopes_.back().reset();
-            self->execution_scopes_.pop_back();
-          }
-          break;
-
-        default:
-          break;
-      }
-    }
-  }
-
-  [[nodiscard]] std::unique_ptr<execution_scope> make_execution_scope() const {
-    if (execution_scope_factory_) {
-      return execution_scope_factory_();
-    }
-
-    return nullptr;
-  }
-
   std::thread thread_;
   std::mutex thread_mutex_;
   cf_ptr<CFRunLoopRef> run_loop_;
 
-  cf_ptr<CFRunLoopObserverRef> begin_observer_;
-  cf_ptr<CFRunLoopObserverRef> end_observer_;
-  cf_ptr<CFRunLoopSourceRef> initial_source_;
-  std::mutex initial_source_mutex_;
+  cf_ptr<CFRunLoopSourceRef> keep_alive_source_;
+  std::mutex keep_alive_source_mutex_;
+  std::atomic<bool> ready_{false};
   failure_policy failure_policy_;
-  execution_scope_factory execution_scope_factory_;
-  std::vector<std::unique_ptr<execution_scope>> execution_scopes_;
+  execution_wrapper execution_wrapper_;
 };
 } // namespace pqrs::cf
