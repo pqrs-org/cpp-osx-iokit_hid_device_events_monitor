@@ -2,12 +2,20 @@
 #include <IOKit/hid/IOHIDUsageTables.h>
 #include <IOKit/hid/IOHIDValue.h>
 #include <csignal>
+#include <functional>
+#include <memory>
+#include <pqrs/osx/autorelease_pool.hpp>
 #include <pqrs/osx/iokit_hid_device_events_monitor.hpp>
 #include <pqrs/osx/iokit_hid_manager.hpp>
 
 namespace {
 auto global_wait = pqrs::make_thread_wait();
+
+void execute_with_autorelease_pool(const std::function<void()>& function) {
+  pqrs::osx::autorelease_pool::scoped_autorelease_pool pool;
+  function();
 }
+} // namespace
 
 int main() {
   std::signal(SIGINT, [](int) {
@@ -15,7 +23,8 @@ int main() {
   });
 
   auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
-  auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+  auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source,
+                                                                   execute_with_autorelease_pool);
   auto run_loop_thread = std::make_shared<pqrs::cf::run_loop_thread>();
 
   std::unordered_map<pqrs::osx::iokit_registry_entry_id::value_t, pqrs::not_null_shared_ptr_t<pqrs::osx::iokit_hid_device_events_monitor>> monitors;
