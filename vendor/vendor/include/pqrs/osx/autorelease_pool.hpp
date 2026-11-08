@@ -1,12 +1,13 @@
 #pragma once
 
-// pqrs::osx::autorelease_pool v1.0.0
+// pqrs::osx::autorelease_pool v1.1.0
 
 // (C) Copyright Takayama Fumihiko 2026.
 // Distributed under the Boost Software License, Version 1.0.
 // (See https://www.boost.org/LICENSE_1_0.txt)
 
 #include "autorelease_pool/impl/impl.h"
+#include <functional>
 
 namespace pqrs::osx::autorelease_pool {
 
@@ -29,5 +30,10 @@ public:
 private:
   void* token_;
 };
+
+inline void execute_with_autorelease_pool(const std::function<void()>& function) {
+  scoped_autorelease_pool pool;
+  function();
+}
 
 } // namespace pqrs::osx::autorelease_pool
