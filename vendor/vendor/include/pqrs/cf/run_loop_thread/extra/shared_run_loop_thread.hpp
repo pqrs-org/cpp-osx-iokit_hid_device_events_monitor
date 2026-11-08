@@ -12,11 +12,14 @@
 
 class shared_run_loop_thread final {
 public:
-  void initialize(failure_policy policy = failure_policy::abort) {
+  void initialize(failure_policy policy = failure_policy::abort,
+                  execution_scope_factory execution_scope_factory = {}) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!run_loop_thread_) {
-      run_loop_thread_ = std::make_shared<run_loop_thread>(policy);
+      run_loop_thread_ = std::make_shared<run_loop_thread>(
+          policy,
+          std::move(execution_scope_factory));
     }
   }
 
@@ -45,9 +48,11 @@ private:
   mutable std::mutex mutex_;
 };
 
-static void initialize_shared_run_loop_thread(failure_policy policy = failure_policy::abort) {
+static void initialize_shared_run_loop_thread(failure_policy policy = failure_policy::abort,
+                                              execution_scope_factory execution_scope_factory = {}) {
   auto p = shared_run_loop_thread::get_shared_run_loop_thread();
-  p->initialize(policy);
+  p->initialize(policy,
+                std::move(execution_scope_factory));
 }
 
 static void terminate_shared_run_loop_thread() {
